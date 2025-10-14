@@ -1,4 +1,5 @@
 Database/
 node_modules/
-
+.env
+.env.example
 Apikey
