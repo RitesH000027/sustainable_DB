@@ -36,7 +36,7 @@ const searchRecipeByName = async (req, res) => {
     const countQuery = `
       SELECT COUNT(*) as total
       FROM cutoff10_recipes_veg_non_veg_sm
-      WHERE LOWER("Recipe Name") LIKE LOWER('%${safeRecipeName}%')
+      WHERE LOWER("recipe name") LIKE LOWER('%${safeRecipeName}%')
     `;
     
     const countResult = await athenaExpress.query({ sql: countQuery });
@@ -59,27 +59,27 @@ const searchRecipeByName = async (req, res) => {
       SELECT *
       FROM (
         SELECT 
-          "Recipe ID",
-          "Recipe Name",
-          "Recipe Ingredient",
-          "Total Ingredient",
-          "Available Ingredients",
-          "Available Count",
-          "Not Available Ingredients",
-          "Not Available Count",
-          "Available Percentage",
-          "Carbon_footprint_sum",
-          "Vegetarian_Recipe",
-          "Non_Vegetarian_Recipe",
-          "Miscellaneous_Recipe",
+          "recipe id",
+          "recipe name",
+          "recipe ingredient",
+          "total ingredient",
+          "available ingredients",
+          "available count",
+          "not available ingredients",
+          "not available count",
+          "available percentage",
+          carbon_footprint_sum,
+          vegetarian_recipe,
+          non_vegetarian_recipe,
+          miscellaneous_recipe,
           continent,
           region,
           sub_region,
           instructions,
           ingredient_phrase,
-          ROW_NUMBER() OVER (ORDER BY "Recipe ID") as row_num
-        FROM recipes_veg_non_veg
-        WHERE LOWER("Recipe Name") LIKE LOWER('%${safeRecipeName}%')
+          ROW_NUMBER() OVER (ORDER BY "recipe id") as row_num
+        FROM cutoff10_recipes_veg_non_veg_sm
+        WHERE LOWER("recipe name") LIKE LOWER('%${safeRecipeName}%')
       ) AS ranked
       WHERE row_num > ${offset} AND row_num <= ${offset + limitNum}
     `;
@@ -114,7 +114,7 @@ const getRecipeDetails = async (req, res) => {
     const query = `
       SELECT *
       FROM cutoff10_recipes_veg_non_veg_sm
-      WHERE "Recipe ID" = ${recipeID}
+      WHERE "recipe id" = ${recipeID}
     `;
     
     const result = await athenaExpress.query({ sql: query });
@@ -139,13 +139,39 @@ const getRecipeDetails = async (req, res) => {
 
 const searchRecipeByIngredients = async (req, res) => {
   try {
-    const { ingredient, page = 1, limit = 10 } = req.query;
+    const { ingredient, include, exclude, page = 1, limit = 10 } = req.query;
+
+    // Handle different input formats for backward compatibility
+    let ingredientQuery = ingredient;
+    
+    // New simplified format support
+    if (!ingredient && (include || exclude)) {
+      let queryParts = [];
+      
+      if (include) {
+        const includeList = include.split(',').map(ing => `@${ing.trim()}`);
+        queryParts = queryParts.concat(includeList);
+      }
+      
+      if (exclude) {
+        const excludeList = exclude.split(',').map(ing => `!${ing.trim()}`);
+        queryParts = queryParts.concat(excludeList);
+      }
+      
+      ingredientQuery = queryParts.join(' ');
+    }
 
     // Validate ingredient parameter
-    if (!ingredient) {
+    if (!ingredientQuery) {
       return res
         .status(400)
-        .send({ message: "Ingredient parameter is required." });
+        .send({ 
+          message: "Ingredient parameter is required. Use 'ingredient' parameter with operators (@include, !exclude, |or) or use 'include'/'exclude' parameters.",
+          examples: {
+            "Advanced syntax": "?ingredient=@chicken @rice !beef |fish",
+            "Simple syntax": "?include=chicken,rice&exclude=beef"
+          }
+        });
     }
 
     // Validate and parse pagination
@@ -157,7 +183,11 @@ const searchRecipeByIngredients = async (req, res) => {
         .send({ message: "Page and limit must be positive integers." });
     }
 
-    const ingredientsArray = ingredient.split(" ");
+    // Handle both space-separated and comma-separated ingredients
+    const ingredientsArray = ingredientQuery.includes(',') ? 
+      ingredientQuery.split(',').map(ing => ing.trim()) : 
+      ingredientQuery.split(' ').filter(ing => ing.trim() !== '');
+      
     let mustHaveIngredients = [];
     let mustNotHaveIngredients = [];
     let orConditions = [];
@@ -165,81 +195,108 @@ const searchRecipeByIngredients = async (req, res) => {
     // Parse ingredients into respective categories
     ingredientsArray.forEach((ing) => {
       ing = ing.trim();
+      if (ing === '') return; // Skip empty strings
+      
       if (ing.startsWith("@")) {
-        mustHaveIngredients.push(ing.slice(1).trim());
+        const ingredient = ing.slice(1).trim();
+        if (ingredient) mustHaveIngredients.push(ingredient);
       } else if (ing.startsWith("!")) {
-        mustNotHaveIngredients.push(ing.slice(1).trim());
+        const ingredient = ing.slice(1).trim();
+        if (ingredient) mustNotHaveIngredients.push(ingredient);
       } else if (ing.startsWith("|")) {
-        orConditions.push(ing.slice(1).trim());
+        const ingredient = ing.slice(1).trim();
+        if (ingredient) orConditions.push(ingredient);
+      } else {
+        // If no operator, treat as must-have ingredient for backward compatibility
+        if (ing) mustHaveIngredients.push(ing);
       }
     });
 
+    // Validate that we have at least one condition
+    if (mustHaveIngredients.length === 0 && mustNotHaveIngredients.length === 0 && orConditions.length === 0) {
+      return res.status(400).send({
+        message: "At least one ingredient condition must be specified.",
+        help: {
+          "Include ingredients": "Use @ prefix or include parameter",
+          "Exclude ingredients": "Use ! prefix or exclude parameter", 
+          "OR conditions": "Use | prefix",
+          "Examples": [
+            "?ingredient=@chicken @rice !beef",
+            "?include=chicken,rice&exclude=beef",
+            "?ingredient=|chicken |fish |beef (any of these)"
+          ]
+        }
+      });
+    }
+
     // Check for conflicts between @ and !
     const conflictingAndNot = mustHaveIngredients.filter((ing) =>
-      mustNotHaveIngredients.includes(ing)
+      mustNotHaveIngredients.some(notIng => 
+        ing.toLowerCase() === notIng.toLowerCase()
+      )
     );
     if (conflictingAndNot.length > 0) {
       return res.status(400).send({
-        message: `Invalid query: Ingredient(s) ${conflictingAndNot.join(
-          ", "
-        )} cannot be in both AND (@) and NOT (!) conditions.`,
+        message: `Invalid query: Ingredient(s) "${conflictingAndNot.join(
+          '", "'
+        )}" cannot be in both include (@) and exclude (!) conditions.`,
       });
     }
 
     // Check for conflicts between ! and |
     const conflictingNotOr = mustNotHaveIngredients.filter((ing) =>
-      orConditions.includes(ing)
+      orConditions.some(orIng => 
+        ing.toLowerCase() === orIng.toLowerCase()
+      )
     );
     if (conflictingNotOr.length > 0) {
       return res.status(400).send({
-        message: `Invalid query: Ingredient(s) ${conflictingNotOr.join(
-          ", "
-        )} cannot be in both NOT (!) and OR (|) conditions.`,
+        message: `Invalid query: Ingredient(s) "${conflictingNotOr.join(
+          '", "'
+        )}" cannot be in both exclude (!) and OR (|) conditions.`,
       });
     }
 
-    // Check for conflict @ and | (optional)
-    const conflictingAndOr = mustHaveIngredients.filter((ing) =>
-      orConditions.includes(ing)
-    );
-    if (conflictingAndOr.length > 0) {
-      return res.status(400).send({
-        message: `Invalid query: Ingredient(s) ${conflictingAndOr.join(
-          ", "
-        )} cannot be in both AND (@) and OR (|) conditions. Please clarify the query.`,
-      });
-    }
+    // Note: @ and | can coexist - it means "must have this AND (one of these OR conditions)"
     
     // Calculate offset for pagination
     const offset = (pageNum - 1) * limitNum;
     
+    // Helper function to sanitize ingredient names for SQL
+    const sanitizeIngredient = (ingredient) => {
+      return ingredient
+        .replace(/'/g, "''")           // Escape single quotes
+        .replace(/[%_]/g, '\\$&')      // Escape SQL LIKE wildcards
+        .trim();
+    };
+
     // Build SQL WHERE conditions for Athena
     let whereClauses = [];
     let whereClause = '';
     
-    // Handle must have ingredients (AND)
+    // Handle must have ingredients (AND) - all must be present
     if (mustHaveIngredients.length > 0) {
       const andConditions = mustHaveIngredients.map(ing => {
-        const safeIng = ing.replace(/'/g, "''");
-        return `LOWER("Recipe Ingredient") LIKE LOWER('%${safeIng}%')`;
+        const safeIng = sanitizeIngredient(ing);
+        return `LOWER("recipe ingredient") LIKE LOWER('%${safeIng}%')`;
       });
       whereClauses.push(`(${andConditions.join(' AND ')})`);
     }
     
-    // Handle must not have ingredients (NOT)
+    // Handle must not have ingredients (NOT) - none should be present
     if (mustNotHaveIngredients.length > 0) {
       const notConditions = mustNotHaveIngredients.map(ing => {
-        const safeIng = ing.replace(/'/g, "''");
-        return `LOWER("Recipe Ingredient") NOT LIKE LOWER('%${safeIng}%')`;
+        const safeIng = sanitizeIngredient(ing);
+        return `LOWER("recipe ingredient") NOT LIKE LOWER('%${safeIng}%')`;
       });
       whereClauses.push(`(${notConditions.join(' AND ')})`);
     }
     
-    // Handle OR conditions
+    // Handle OR conditions - at least one must be present
     if (orConditions.length > 0) {
       const orClause = orConditions.map(ing => {
-        const safeIng = ing.replace(/'/g, "''");
-        return `LOWER("Recipe Ingredient") LIKE LOWER('%${safeIng}%')`;
+        const safeIng = sanitizeIngredient(ing);
+        return `LOWER("recipe ingredient") LIKE LOWER('%${safeIng}%')`;
       }).join(' OR ');
       whereClauses.push(`(${orClause})`);
     }
@@ -251,7 +308,7 @@ const searchRecipeByIngredients = async (req, res) => {
     // Count total matching recipes
     const countQuery = `
       SELECT COUNT(*) as total
-      FROM recipes_veg_non_veg
+      FROM cutoff10_recipes_veg_non_veg_sm
       ${whereClause}
     `;
     
@@ -278,19 +335,19 @@ const searchRecipeByIngredients = async (req, res) => {
       SELECT *
       FROM (
         SELECT 
-          "Recipe ID",
-          "Recipe Name", 
-          "Recipe Ingredient", 
-          "Total Ingredient",
-          "Available Ingredients",
-          "Available Count",
-          "Not Available Ingredients",
-          "Not Available Count",
-          "Available Percentage",
-          "Carbon_footprint_sum",
-          "Vegetarian_Recipe",
-          "Non_Vegetarian_Recipe",
-          "Miscellaneous_Recipe",
+          "recipe id",
+          "recipe name", 
+          "recipe ingredient", 
+          "total ingredient",
+          "available ingredients",
+          "available count",
+          "not available ingredients",
+          "not available count",
+          "available percentage",
+          carbon_footprint_sum,
+          vegetarian_recipe,
+          non_vegetarian_recipe,
+          miscellaneous_recipe,
           continent,
           region,
           sub_region,
@@ -307,13 +364,22 @@ const searchRecipeByIngredients = async (req, res) => {
     const dataResult = await athenaExpress.query({ sql: dataQuery });
     const recipes = dataResult.Items;
     
-    // Return the results
+    // Return the results with query info
     res.status(200).send({
-      page: pageNum,
-      limit: limitNum,
-      totalResults,
-      totalPages,
-      recipes,
+      success: true,
+      message: "Recipes fetched successfully",
+      query: {
+        mustHave: mustHaveIngredients,
+        mustNotHave: mustNotHaveIngredients,
+        anyOf: orConditions
+      },
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        totalResults,
+        totalPages
+      },
+      data: recipes,
     });
   } catch (err) {
     console.error(err);
@@ -338,16 +404,16 @@ const getRecipeIngredientsCarbonFootprint = async (req, res) => {
         return res.status(400).send({ message: "Invalid Recipe ID" });
       }
       recipeQuery = `
-        SELECT "Recipe ID", "Recipe Name", "Recipe Ingredient"
+        SELECT "recipe id", "recipe name", "recipe ingredient"
         FROM cutoff10_recipes_veg_non_veg_sm
-        WHERE "Recipe ID" = ${recipeId}
+        WHERE "recipe id" = ${recipeId}
       `;
     } else {
       const safeRecipeName = recipeName.replace(/'/g, "''");
       recipeQuery = `
-        SELECT "Recipe ID", "Recipe Name", "Recipe Ingredient"
+        SELECT "recipe id", "recipe name", "recipe ingredient"
         FROM cutoff10_recipes_veg_non_veg_sm
-        WHERE LOWER("Recipe Name") LIKE LOWER('%${safeRecipeName}%')
+        WHERE LOWER("recipe name") LIKE LOWER('%${safeRecipeName}%')
         LIMIT 1
       `;
     }
@@ -365,9 +431,9 @@ const getRecipeIngredientsCarbonFootprint = async (req, res) => {
     // Parse ingredient list from recipe
     let ingredients;
     try {
-      ingredients = JSON.parse(recipe["Recipe Ingredient"].replace(/'/g, '"'));
-    } catch (err) {
-      console.error("Invalid Recipe Ingredient JSON:", recipe["Recipe Ingredient"]);
+      ingredients = JSON.parse(recipe["recipe ingredient"].replace(/'/g, '"'));
+    } catch (error) {
+      console.error("Invalid Recipe Ingredient JSON:", recipe["recipe ingredient"]);
       return res.status(500).send({ message: "Invalid Recipe Ingredient format" });
     }
     
@@ -386,7 +452,7 @@ const getRecipeIngredientsCarbonFootprint = async (req, res) => {
       const ingredientQuery = `
         SELECT "RecipeDB Ingredient", "Carbon Footprint"
         FROM ingredient_details_server
-        WHERE LOWER("RecipeDB Ingredient") LIKE LOWER('%${safeIngredient}%')
+        WHERE LOWER("recipedb_ingredient") LIKE LOWER('%${safeIngredient}%')
         LIMIT 1
       `;
       
@@ -405,7 +471,7 @@ const getRecipeIngredientsCarbonFootprint = async (req, res) => {
           const mappedQuery = `
             SELECT "Sueatable Ingredient", "CF"
             FROM recipedb_mapped_ing_cf_count
-            WHERE LOWER("Sueatable Ingredient") LIKE LOWER('%${splitIngredient}%')
+            WHERE LOWER("sueatable_ingredient") LIKE LOWER('%${splitIngredient}%')
             LIMIT 1
           `;
           
@@ -554,19 +620,19 @@ const getRecipesByCarbonFootprintSumWithFilterRange = async (req, res) => {
       SELECT *
       FROM (
         SELECT 
-          "Recipe ID",
-          "Recipe Name", 
-          "Recipe Ingredient", 
-          "Total Ingredient",
-          "Available Ingredients",
-          "Available Count",
-          "Not Available Ingredients",
-          "Not Available Count",
-          "Available Percentage",
-          "Carbon_footprint_sum",
-          "Vegetarian_Recipe",
-          "Non_Vegetarian_Recipe",
-          "Miscellaneous_Recipe",
+          "recipe id",
+          "recipe name", 
+          "recipe ingredient", 
+          "total ingredient",
+          "available ingredients",
+          "available count",
+          "not available ingredients",
+          "not available count",
+          "available percentage",
+          carbon_footprint_sum,
+          vegetarian_recipe,
+          non_vegetarian_recipe,
+          miscellaneous_recipe,
           continent,
           region,
           sub_region,
@@ -597,10 +663,207 @@ const getRecipesByCarbonFootprintSumWithFilterRange = async (req, res) => {
   }
 };
 
+// Advanced recipe search with multiple criteria
+const advancedRecipeSearch = async (req, res) => {
+  try {
+    const { 
+      include,           // Comma-separated ingredients that MUST be included
+      exclude,           // Comma-separated ingredients that MUST NOT be included
+      anyOf,             // Comma-separated ingredients where ANY can be present
+      vegetarian,        // Filter for vegetarian recipes
+      region,            // Filter by region
+      maxCookTime,       // Maximum cooking time
+      minCarbonFootprint, // Minimum carbon footprint
+      maxCarbonFootprint, // Maximum carbon footprint
+      page = 1, 
+      limit = 10 
+    } = req.query;
+
+    const { pageNum, limitNum } = validatePagination(page, limit);
+    
+    // Build ingredient conditions
+    let ingredientClauses = [];
+    
+    if (include) {
+      const includeList = include.split(',').map(ing => ing.trim()).filter(ing => ing);
+      if (includeList.length > 0) {
+        const includeConditions = includeList.map(ing => {
+          const safeIng = ing.replace(/'/g, "''").replace(/[%_]/g, '\\$&');
+          return `LOWER("recipe ingredient") LIKE LOWER('%${safeIng}%')`;
+        });
+        ingredientClauses.push(`(${includeConditions.join(' AND ')})`);
+      }
+    }
+    
+    if (exclude) {
+      const excludeList = exclude.split(',').map(ing => ing.trim()).filter(ing => ing);
+      if (excludeList.length > 0) {
+        const excludeConditions = excludeList.map(ing => {
+          const safeIng = ing.replace(/'/g, "''").replace(/[%_]/g, '\\$&');
+          return `LOWER("recipe ingredient") NOT LIKE LOWER('%${safeIng}%')`;
+        });
+        ingredientClauses.push(`(${excludeConditions.join(' AND ')})`);
+      }
+    }
+    
+    if (anyOf) {
+      const anyOfList = anyOf.split(',').map(ing => ing.trim()).filter(ing => ing);
+      if (anyOfList.length > 0) {
+        const anyOfConditions = anyOfList.map(ing => {
+          const safeIng = ing.replace(/'/g, "''").replace(/[%_]/g, '\\$&');
+          return `LOWER("recipe ingredient") LIKE LOWER('%${safeIng}%')`;
+        });
+        ingredientClauses.push(`(${anyOfConditions.join(' OR ')})`);
+      }
+    }
+    
+    // Build additional filters
+    let additionalClauses = [];
+    
+    if (vegetarian === 'true') {
+      additionalClauses.push(`vegetarian_recipe = 1`);
+    } else if (vegetarian === 'false') {
+      additionalClauses.push(`non_vegetarian_recipe = 1`);
+    }
+    
+    if (region) {
+      const safeRegion = region.replace(/'/g, "''");
+      additionalClauses.push(`LOWER("region") LIKE LOWER('%${safeRegion}%')`);
+    }
+    
+    if (maxCookTime) {
+      const cookTime = parseInt(maxCookTime, 10);
+      if (!isNaN(cookTime)) {
+        additionalClauses.push(`CAST("Cook Time" AS INTEGER) <= ${cookTime}`);
+      }
+    }
+    
+    if (minCarbonFootprint || maxCarbonFootprint) {
+      if (minCarbonFootprint) {
+        const minCF = parseFloat(minCarbonFootprint);
+        if (!isNaN(minCF)) {
+          additionalClauses.push(`"Carbon_footprint_sum" >= ${minCF}`);
+        }
+      }
+      if (maxCarbonFootprint) {
+        const maxCF = parseFloat(maxCarbonFootprint);
+        if (!isNaN(maxCF)) {
+          additionalClauses.push(`"Carbon_footprint_sum" <= ${maxCF}`);
+        }
+      }
+    }
+    
+    // Combine all conditions
+    let allClauses = [...ingredientClauses, ...additionalClauses];
+    let whereClause = allClauses.length > 0 ? `WHERE ${allClauses.join(' AND ')}` : '';
+    
+    if (!whereClause) {
+      return res.status(400).send({
+        message: "At least one search criterion must be specified.",
+        availableFilters: {
+          "include": "Ingredients that must be present (comma-separated)",
+          "exclude": "Ingredients that must not be present (comma-separated)",
+          "anyOf": "Ingredients where any can be present (comma-separated)",
+          "vegetarian": "true/false for vegetarian filter",
+          "region": "Cuisine region filter",
+          "maxCookTime": "Maximum cooking time in minutes",
+          "minCarbonFootprint": "Minimum carbon footprint",
+          "maxCarbonFootprint": "Maximum carbon footprint"
+        }
+      });
+    }
+    
+    const offset = (pageNum - 1) * limitNum;
+    
+    // Count query
+    const countQuery = `
+      SELECT COUNT(*) as total
+      FROM cutoff10_recipes_veg_non_veg_sm
+      ${whereClause}
+    `;
+    
+    const countResult = await athenaExpress.query({ sql: countQuery });
+    const totalResults = parseInt(countResult.Items[0].total);
+    
+    if (totalResults === 0) {
+      return res.status(200).send({ 
+        success: true,
+        message: "No recipes found matching the specified criteria.",
+        query: req.query,
+        totalResults: 0
+      });
+    }
+    
+    const totalPages = Math.ceil(totalResults / limitNum);
+    
+    // Data query
+    const dataQuery = `
+      SELECT *
+      FROM (
+        SELECT 
+          "recipe id",
+          "recipe name", 
+          "recipe ingredient", 
+          "total ingredient",
+          "available ingredients",
+          "available count",
+          "not available ingredients", 
+          "not available count",
+          "available percentage",
+          carbon_footprint_sum,
+          vegetarian_recipe,
+          non_vegetarian_recipe,
+          "Miscellaneous_Recipe",
+          continent,
+          region,
+          sub_region,
+          instructions,
+          ingredient_phrase,
+          ROW_NUMBER() OVER (ORDER BY "Recipe ID") as row_num
+        FROM cutoff10_recipes_veg_non_veg_sm
+        ${whereClause}
+      ) AS ranked
+      WHERE row_num > ${offset} AND row_num <= ${offset + limitNum}
+    `;
+    
+    const dataResult = await athenaExpress.query({ sql: dataQuery });
+    const recipes = dataResult.Items;
+    
+    res.status(200).send({
+      success: true,
+      message: "Advanced recipe search completed successfully",
+      query: {
+        include: include?.split(',').map(s => s.trim()).filter(s => s) || [],
+        exclude: exclude?.split(',').map(s => s.trim()).filter(s => s) || [],
+        anyOf: anyOf?.split(',').map(s => s.trim()).filter(s => s) || [],
+        filters: {
+          vegetarian,
+          region,
+          maxCookTime,
+          minCarbonFootprint,
+          maxCarbonFootprint
+        }
+      },
+      pagination: {
+        page: pageNum,
+        limit: limitNum,
+        totalResults,
+        totalPages
+      },
+      data: recipes
+    });
+    
+  } catch (err) {
+    console.error(err);
+    res.status(500).send({ message: err.message || "Internal Server Error" });
+  }
+};
+
 module.exports = {
   searchRecipeByName,
   getRecipeDetails,
   searchRecipeByIngredients,
   getRecipeIngredientsCarbonFootprint,
   getRecipesByCarbonFootprintSumWithFilterRange,
+  advancedRecipeSearch,
 };
